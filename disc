@@ -1,0 +1,426 @@
+-- ===========================
+-- WEBHOOK DISCONNECTION NOTIFIER
+-- Detect disconnect using Roblox events & send webhook
+-- ===========================
+
+local WebhookDisconnect = {}
+WebhookDisconnect.__index = WebhookDisconnect
+
+local logger = _G.Logger and _G.Logger.new("DISC") or {
+    debug = function() end,
+    info = function() end,
+    warn = function() end,
+    error = function() end
+}
+
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local GuiService = game:GetService("GuiService")
+local LogService = game:GetService("LogService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- ===========================
+-- CONFIG
+-- ===========================
+local CFG = {
+    DEBUG = true,
+    MAX_RETRIES = 3,              -- Max retry kirim webhook
+    RETRY_DELAY = 1,              -- Delay antar retry (detik)
+    DEDUP_WINDOW = 5              -- Prevent spam dalam 5 detik
+}
+
+-- ===========================
+-- STATE
+-- ===========================
+local state = {
+    running = false,
+    webhookUrl = "",
+    
+    -- Disconnect tracking
+    disconnected = false,
+    disconnectTime = 0,
+    disconnectReason = "Unknown",
+    lastNotifTime = 0,
+    
+    -- Connections
+    connections = {}
+}
+
+-- ===========================
+-- UTILS
+-- ===========================
+
+local function now()
+    return os.clock()
+end
+
+-- ===========================
+-- HTTP
+-- ===========================
+local requestFn = (function()
+    if syn and type(syn.request) == "function" then return syn.request end
+    if http and type(http.request) == "function" then return http.request end
+    if type(http_request) == "function" then return http_request end
+    if type(request) == "function" then return request end
+    if fluxus and type(fluxus.request) == "function" then return fluxus.request end
+    return nil
+end)()
+
+local function httpRequest(params)
+    if not requestFn then return nil, "no_http" end
+    
+    local ok, res = pcall(requestFn, params)
+    if not ok then return nil, tostring(res) end
+    
+    local code = tonumber(res.StatusCode or res.Status) or 0
+    if code < 200 or code >= 300 then
+        return nil, "status_" .. code
+    end
+    
+    return res.Body or "", nil
+end
+
+local function sendWebhook(payload)
+    if not state.webhookUrl or state.webhookUrl == "" then
+        return false, "no_url"
+    end
+    
+    local body, err = httpRequest({
+        Url = state.webhookUrl,
+        Method = "POST",
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["User-Agent"] = "Mozilla/5.0"
+        },
+        Body = HttpService:JSONEncode(payload)
+    })
+    
+    if err then
+        return false, err
+    end
+    
+    return true, nil
+end
+
+local function sendWebhookWithRetry(payload)
+    for attempt = 1, CFG.MAX_RETRIES do
+        local success, err = sendWebhook(payload)
+        
+        if success then
+            logger:info("✅ Webhook sent successfully")
+            return true
+        end
+        
+        logger:info("❌ Webhook failed (attempt " .. attempt .. "): " .. tostring(err))
+        
+        if attempt < CFG.MAX_RETRIES then
+            task.wait(CFG.RETRY_DELAY)
+        end
+    end
+    
+    logger:info("❌ Webhook failed after " .. CFG.MAX_RETRIES .. " attempts")
+    return false
+end
+
+-- ===========================
+-- EMBED BUILDER
+-- ===========================
+local function buildDisconnectEmbed(reason)
+    local timeStr = os.date("%Y-%m-%d %H:%M:%S", os.time())
+    local sessionTime = math.floor((now() - (state.disconnectTime or 0)) / 60)
+    
+    return {
+        title = "🔴 Disconnected",
+        description = string.format("**Player:** ||%s||\n**Status:** Lost connection to server", LocalPlayer.Name),
+        color = 0xFF0000,  -- Red
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        footer = {text = "Noctis Notifier"},
+        fields = {
+            {
+                name = "⏰ Disconnect Time",
+                value = "```" .. timeStr .. "```",
+                inline = false
+            },
+            {
+                name = "📝 Reason",
+                value = "```" .. (reason or "Connection lost") .. "```",
+                inline = false
+            },
+            {
+                name = "🎮 Game Info",
+                value = string.format("```Place ID: %s\nJob ID: %s```", 
+                    tostring(game.PlaceId), 
+                    game.JobId:sub(1, 8) .. "..."
+                ),
+                inline = false
+            }
+        }
+    }
+end
+
+-- ===========================
+-- DISCONNECT DETECTION
+-- ===========================
+local function shouldSendNotif()
+    -- Dedup: prevent spam dalam waktu singkat
+    local timeSinceLastNotif = now() - state.lastNotifTime
+    
+    if timeSinceLastNotif < CFG.DEDUP_WINDOW then
+        logger:info("⏭️ Skipping notification (dedup window)")
+        return false
+    end
+    
+    return true
+end
+
+local function triggerDisconnect(reason)
+    if state.disconnected then
+        logger:info("⚠️ Already disconnected, ignoring")
+        return
+    end
+    
+    if not shouldSendNotif() then
+        return
+    end
+    
+    state.disconnected = true
+    state.disconnectTime = now()
+    state.disconnectReason = reason or "Unknown"
+    state.lastNotifTime = now()
+    
+    logger:info("🔴 DISCONNECT DETECTED: " .. state.disconnectReason)
+    
+    -- Build embed
+    local embed = buildDisconnectEmbed(state.disconnectReason)
+    
+    -- Send webhook dengan @everyone ping
+    local payload = {
+        content = "@everyone",  -- Ping everyone!
+        username = "Noctis Notifier",
+        embeds = {embed}
+    }
+    
+    -- Kirim dalam thread terpisah biar ga block
+    task.spawn(function()
+        sendWebhookWithRetry(payload)
+    end)
+end
+
+-- ===========================
+-- EVENT LISTENERS
+-- ===========================
+local function setupPlayerParentListener()
+    -- Detect player removed from game (kicked/disconnect)
+    local conn = LocalPlayer:GetPropertyChangedSignal("Parent"):Connect(function()
+        if not LocalPlayer.Parent then
+            triggerDisconnect("Player removed from game")
+        end
+    end)
+    
+    table.insert(state.connections, conn)
+    logger:info("✓ Player.Parent listener attached")
+end
+
+local function setupGuiServiceListener()
+    -- Detect error messages (disconnect, kick, etc)
+    local conn = GuiService.ErrorMessageChanged:Connect(function(message)
+        if message and message ~= "" then
+            local msgLower = message:lower()
+            
+            -- Check for disconnect keywords
+            if msgLower:find("disconnect") or 
+               msgLower:find("lost connection") or
+               msgLower:find("connection lost") or
+               msgLower:find("kicked") or
+               msgLower:find("you have been kicked") or
+               msgLower:find("failed to connect") then
+                
+                triggerDisconnect("Error: " .. message:sub(1, 100))
+            end
+        end
+    end)
+    
+    table.insert(state.connections, conn)
+    logger:info("✓ GuiService.ErrorMessage listener attached")
+end
+
+local function setupLogServiceListener()
+    -- Monitor console logs untuk disconnect message
+    local conn = LogService.MessageOut:Connect(function(message, messageType)
+        if messageType == Enum.MessageType.MessageError then
+            local msgLower = message:lower()
+            
+            -- Check for disconnect/connection errors
+            if msgLower:find("disconnect") or 
+               msgLower:find("connection") or
+               msgLower:find("timeout") or
+               msgLower:find("network") then
+                
+                triggerDisconnect("Log Error: " .. message:sub(1, 100))
+            end
+        end
+    end)
+    
+    table.insert(state.connections, conn)
+    logger:info("✓ LogService.MessageOut listener attached")
+end
+
+local function setupNetworkListener()
+    -- Additional: Monitor Players.PlayerRemoving untuk detect kick
+    local conn = Players.PlayerRemoving:Connect(function(player)
+        if player == LocalPlayer then
+            triggerDisconnect("Player removing from server")
+        end
+    end)
+    
+    table.insert(state.connections, conn)
+    logger:info("✓ Players.PlayerRemoving listener attached")
+end
+
+-- ===========================
+-- PUBLIC API
+-- ===========================
+function WebhookDisconnect:Init()
+    logger:info("=== INITIALIZING WEBHOOK DISCONNECT MONITOR ===")
+    
+    -- Reset state
+    state.disconnected = false
+    state.disconnectTime = 0
+    state.disconnectReason = "Unknown"
+    state.lastNotifTime = 0
+    
+    logger:info("=== INIT COMPLETE ===")
+    return true
+end
+
+function WebhookDisconnect:Start(webhookUrl)
+    if state.running then
+        logger:info("⚠️ Already running, stopping first...")
+        self:Stop()
+    end
+    
+    state.webhookUrl = webhookUrl or state.webhookUrl or ""
+    
+    if state.webhookUrl == "" then
+        logger:info("❌ No webhook URL provided")
+        return false
+    end
+    
+    state.running = true
+    
+    -- Setup all event listeners
+    setupPlayerParentListener()
+    setupGuiServiceListener()
+    setupLogServiceListener()
+    setupNetworkListener()
+    
+    logger:info("✅ Started monitoring - URL: " .. state.webhookUrl:sub(1, 50) .. "...")
+    logger:info("📡 Listening for disconnect events...")
+    return true
+end
+
+function WebhookDisconnect:Stop()
+    if not state.running then
+        logger:info("⚠️ Not running")
+        return
+    end
+    
+    state.running = false
+    
+    -- Disconnect all listeners
+    for _, conn in ipairs(state.connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    state.connections = {}
+    
+    logger:info("⏹️ Stopped monitoring")
+end
+
+function WebhookDisconnect:Cleanup()
+    self:Stop()
+    
+    -- Reset semua state
+    state.webhookUrl = ""
+    state.disconnected = false
+    state.disconnectTime = 0
+    state.disconnectReason = "Unknown"
+    state.lastNotifTime = 0
+    
+    logger:info("🧹 Cleanup complete")
+end
+
+-- ===========================
+-- GETTERS & SETTERS
+-- ===========================
+function WebhookDisconnect:SetWebhookUrl(url)
+    state.webhookUrl = url or ""
+    logger:info("Webhook URL updated")
+end
+
+function WebhookDisconnect:GetStatus()
+    return {
+        running = state.running,
+        webhookUrl = state.webhookUrl ~= "" and (state.webhookUrl:sub(1, 50) .. "...") or "Not set",
+        disconnected = state.disconnected,
+        disconnectReason = state.disconnectReason,
+        listenersActive = #state.connections,
+        lastNotifTime = state.lastNotifTime > 0 and os.date("%H:%M:%S", state.lastNotifTime) or "Never"
+    }
+end
+
+function WebhookDisconnect:IsDisconnected()
+    return state.disconnected
+end
+
+function WebhookDisconnect:GetDisconnectReason()
+    return state.disconnectReason
+end
+
+-- ===========================
+-- TEST & DEBUG
+-- ===========================
+function WebhookDisconnect:TestDisconnect(customReason)
+    logger:info("🧪 Simulating disconnect...")
+    triggerDisconnect(customReason or "Manual test trigger")
+end
+
+function WebhookDisconnect:TestWebhook()
+    if state.webhookUrl == "" then
+        logger:info("❌ No webhook URL")
+        return false
+    end
+    
+    local success = sendWebhookWithRetry({
+        content = "@everyone",
+        username = "Noctis Notifier",
+        embeds = {{
+            title = "🟠 Test Notification",
+            description = "This is a test from Disconnect Monitor",
+            color = 0xFFA500,
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+        }}
+    })
+    
+    return success
+end
+
+function WebhookDisconnect:EnableDebug()
+    CFG.DEBUG = true
+    logger:info("Debug mode enabled")
+end
+
+function WebhookDisconnect:DisableDebug()
+    CFG.DEBUG = false
+end
+
+function WebhookDisconnect:SetDedupWindow(seconds)
+    CFG.DEDUP_WINDOW = math.max(0, seconds or 5)
+    logger:info("Dedup window set to " .. CFG.DEDUP_WINDOW .. " seconds")
+end
+
+function WebhookDisconnect:GetListenerCount()
+    return #state.connections
+end
+
+return WebhookDisconnect
