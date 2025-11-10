@@ -148,7 +148,7 @@ function Helpers.getEnchantStonesForTrade()
     for _, item in pairs(ItemsModule:GetChildren()) do
         if item:IsA("ModuleScript") then
             local success, moduleData = pcall(require, item)
-            if success and moduleData and moduleData.Data and moduleData.Data.Type == "Enchant Stone" and moduleData.Data.Name then
+            if success and moduleData and moduleData.Data and moduleData.Data.Type == "Enchant Stones" and moduleData.Data.Name then
                 table.insert(enchantStoneNames, moduleData.Data.Name)
             end
         end
