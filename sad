@@ -1,0 +1,575 @@
+--[[
+    Auto Kaitun - Rod Progression
+    Auto-detect phase & farm coins untuk upgrade rod
+    Phase 1: Starter → Steampunk (215K)
+    Phase 2: Steampunk → Astral (1M)
+    Phase 3: Astral → Ares (3M)
+    By: c3iv3r
+]]
+
+local AutoKaitun = {}
+AutoKaitun.__index = AutoKaitun
+
+-- Logger
+local logger = _G.Logger and _G.Logger.new("AutoKaitun") or {
+    debug = function() end,
+    info = function() end,
+    warn = function() end,
+    error = function() end
+}
+
+-- Services
+local Players = _G.Players
+local ReplicatedStorage = _G.ReplicatedStorage
+
+-- Network - Use global remotes
+local GlobalRemotes = _G.Remotes
+local Remotes = {}
+
+-- Rod IDs
+local ROD_IDS = {
+    Starter = 1,
+    Steampunk = 6,
+    Astral = 5,
+    Ares = 126
+}
+
+-- Phase Configuration
+local PHASE_CONFIG = {
+    PHASE_1 = {
+        name = "Starter → Steampunk",
+        targetCoins = 215000,
+        targetRodName = "Steampunk Rod",
+        targetRodId = ROD_IDS.Steampunk,
+        currentRodId = ROD_IDS.Starter
+    },
+    PHASE_2 = {
+        name = "Steampunk → Astral",
+        targetCoins = 1000000,
+        targetRodName = "Astral Rod",
+        targetRodId = ROD_IDS.Astral,
+        currentRodId = ROD_IDS.Steampunk
+    },
+    PHASE_3 = {
+        name = "Astral → Ares",
+        targetCoins = 3000000,
+        targetRodName = "Ares Rod",
+        targetRodId = ROD_IDS.Ares,
+        currentRodId = ROD_IDS.Astral
+    }
+}
+
+-- Kohana Location
+local KOHANA_LOCATION = CFrame.new(-641.098267, 16.0354462, 611.625916, 0.999887645, 1.07221638e-07, -0.0149896732, -1.06285079e-07, 1, 6.32765662e-08, 0.0149896732, -6.16762748e-08, 0.999887645)
+
+-- Auto Sell Config
+local SELL_CONFIG = {
+    threshold = "Legendary",
+    sellMode = "inventory",
+    inventoryThreshold = 1000, -- Sell when inventory >= 1000 fish
+    autoOnLimit = true
+}
+
+--------------------------------------------------------------------------
+-- Initialize
+--------------------------------------------------------------------------
+
+local function initializeRemotes()
+    local success = pcall(function()
+        Remotes.EquipTool = GlobalRemotes.EquipToolFromHotbar
+        Remotes.PurchaseRod = GlobalRemotes.PurchaseFishingRod
+    end)
+    return success
+end
+
+--------------------------------------------------------------------------
+-- Main Class
+--------------------------------------------------------------------------
+
+function AutoKaitun.new()
+    local self = setmetatable({}, AutoKaitun)
+
+    self.Running = false
+    self.Initialized = false
+    self.PlayerData = nil
+    self.ItemsFolder = nil
+
+    self.CurrentPhase = nil
+    self.PhaseConfig = nil
+    self.CurrentCoins = 0
+
+    self.FishingActive = false
+    self.SellingActive = false
+
+    self.CoinsConnection = nil
+
+    return self
+end
+
+--------------------------------------------------------------------------
+-- Init
+--------------------------------------------------------------------------
+
+function AutoKaitun:Init()
+    if self.Initialized then
+        logger:warn("Already initialized!")
+        return false
+    end
+
+    logger:info("Initializing Kaitun...")
+
+    if not initializeRemotes() then
+        logger:error("Failed to initialize remotes!")
+        return false
+    end
+
+    -- Get PlayerData
+    local Replion = require(ReplicatedStorage.Packages.Replion)
+    self.PlayerData = Replion.Client:WaitReplion("Data")
+    if not self.PlayerData then
+        logger:error("Failed to get player data!")
+        return false
+    end
+
+    -- Get Items folder for rod scanning
+    local success, items = pcall(function()
+        return ReplicatedStorage:WaitForChild("Items", 5)
+    end)
+    if success and items then
+        self.ItemsFolder = items
+    else
+        logger:warn("Failed to find ReplicatedStorage.Items")
+    end
+
+    -- Detect current phase
+    local phase, config = self:DetectPhase()
+    if phase == "COMPLETE" then
+        logger:info("🎉 Kaitun Complete! Player already has Ares Rod!")
+        self.Initialized = true
+        return false
+    end
+
+    self.CurrentPhase = phase
+    self.PhaseConfig = config
+    self.CurrentCoins = self:GetCurrentCoins()
+
+    self.Initialized = true
+    logger:info("Initialized successfully!")
+    logger:info(string.format("📍 Current Phase: %s", config.name))
+    logger:info(string.format("💰 Coins: %s / %s", self:FormatNumber(self.CurrentCoins), self:FormatNumber(config.targetCoins)))
+
+    return true
+end
+
+--------------------------------------------------------------------------
+-- Phase Detection
+--------------------------------------------------------------------------
+
+function AutoKaitun:HasRod(rodId)
+    if not self.PlayerData then return false end
+
+    local rods = self.PlayerData:Get({"Inventory", "Fishing Rods"})
+    if not rods then return false end
+
+    for _, rod in ipairs(rods) do
+        if rod.Id == rodId then
+            return true
+        end
+    end
+
+    return false
+end
+
+function AutoKaitun:DetectPhase()
+    -- Check from highest to lowest rod
+    if self:HasRod(ROD_IDS.Ares) then
+        return "COMPLETE", nil
+    elseif self:HasRod(ROD_IDS.Astral) then
+        return "PHASE_3", PHASE_CONFIG.PHASE_3
+    elseif self:HasRod(ROD_IDS.Steampunk) then
+        return "PHASE_2", PHASE_CONFIG.PHASE_2
+    else
+        return "PHASE_1", PHASE_CONFIG.PHASE_1
+    end
+end
+
+--------------------------------------------------------------------------
+-- Coins Tracking
+--------------------------------------------------------------------------
+
+function AutoKaitun:GetCurrentCoins()
+    if not self.PlayerData then return 0 end
+
+    local coins = self.PlayerData:Get("Coins")
+    return coins or 0
+end
+
+function AutoKaitun:FormatNumber(num)
+    if num >= 1000000 then
+        return string.format("%.2fM", num / 1000000)
+    elseif num >= 1000 then
+        return string.format("%.1fK", num / 1000)
+    else
+        return tostring(num)
+    end
+end
+
+function AutoKaitun:StartCoinsTracking()
+    if self.CoinsConnection then
+        self.CoinsConnection:Disconnect()
+    end
+
+    self.CoinsConnection = self.PlayerData:OnChange("Coins", function(newCoins)
+        if not self.Running then return end
+
+        self.CurrentCoins = newCoins or 0
+        local percentage = math.floor((self.CurrentCoins / self.PhaseConfig.targetCoins) * 100)
+
+        logger:info(string.format("💰 Coins: %s / %s (%.1f%%)",
+            self:FormatNumber(self.CurrentCoins),
+            self:FormatNumber(self.PhaseConfig.targetCoins),
+            percentage
+        ))
+
+        -- Check if reached target
+        if self.CurrentCoins >= self.PhaseConfig.targetCoins then
+            logger:info("✅ Target coins reached!")
+            self:Stop()
+            task.wait(1)
+
+            -- Try to buy rod
+            if self:BuyTargetRod() then
+                -- Re-detect phase
+                local newPhase, newConfig = self:DetectPhase()
+
+                if newPhase == "COMPLETE" then
+                    logger:info("🎉 KAITUN COMPLETE! All rods obtained!")
+                    return
+                end
+
+                -- Update to next phase
+                self.CurrentPhase = newPhase
+                self.PhaseConfig = newConfig
+                logger:info(string.format("📍 Moving to next phase: %s", newConfig.name))
+
+                -- Restart for next phase
+                task.wait(2)
+                self:Start()
+            end
+        end
+    end)
+end
+
+function AutoKaitun:StopCoinsTracking()
+    if self.CoinsConnection then
+        self.CoinsConnection:Disconnect()
+        self.CoinsConnection = nil
+    end
+end
+
+--------------------------------------------------------------------------
+-- Auto Fish
+--------------------------------------------------------------------------
+
+function AutoKaitun:StartAutoFish()
+    if self.FishingActive then return end
+
+    logger:info("🎣 Starting AutoFish...")
+
+    -- Teleport to Kohana
+    if not self:Teleport(KOHANA_LOCATION) then
+        logger:warn("Failed to teleport to Kohana")
+        return false
+    end
+
+    task.wait(0.5)
+
+    -- Equip rod
+    if not self:EquipRod(1) then
+        logger:warn("Failed to equip rod")
+        return false
+    end
+
+    task.wait(0.2)
+
+    -- Use AutoFishV3 from global feature manager
+    if _G.F and _G.F.AutoFishV3 then
+        local success = pcall(function()
+            _G.F.AutoFishV3:Start()
+        end)
+
+        if success then
+            self.FishingActive = true
+            logger:info("✅ AutoFish active (using AutoFishV3)")
+            return true
+        else
+            logger:warn("Failed to start AutoFishV3")
+            return false
+        end
+    else
+        logger:warn("AutoFishV3 not available")
+        return false
+    end
+end
+
+function AutoKaitun:StopAutoFish()
+    if not self.FishingActive then return end
+
+    -- Use AutoFishV3 from global feature manager
+    if _G.F and _G.F.AutoFishV3 then
+        pcall(function()
+            _G.F.AutoFishV3:Stop()
+        end)
+    end
+
+    self.FishingActive = false
+    logger:info("AutoFish stopped")
+end
+
+function AutoKaitun:EquipRod(slot)
+    if not Remotes.EquipTool then return false end
+
+    local success = pcall(function()
+        Remotes.EquipTool:FireServer(slot)
+    end)
+
+    return success
+end
+
+--------------------------------------------------------------------------
+-- Auto Sell (Using _G.F.AutoSellFish)
+--------------------------------------------------------------------------
+
+function AutoKaitun:StartAutoSell()
+    if self.SellingActive then return end
+
+    logger:info("💰 Starting AutoSell (Inventory-based)...")
+
+    -- Use AutoSellFish from global feature manager
+    if _G.F and _G.F.AutoSellFish then
+        local success = pcall(function()
+            _G.F.AutoSellFish:Start(SELL_CONFIG)
+        end)
+
+        if success then
+            self.SellingActive = true
+            logger:info("✅ AutoSell active (using AutoSellFish)")
+            return true
+        else
+            logger:warn("Failed to start AutoSellFish")
+            return false
+        end
+    else
+        logger:warn("AutoSellFish not available")
+        return false
+    end
+end
+
+function AutoKaitun:StopAutoSell()
+    if not self.SellingActive then return end
+
+    -- Use AutoSellFish from global feature manager
+    if _G.F and _G.F.AutoSellFish then
+        pcall(function()
+            _G.F.AutoSellFish:Stop()
+        end)
+    end
+
+    self.SellingActive = false
+    logger:info("AutoSell stopped")
+end
+
+--------------------------------------------------------------------------
+-- Teleport
+--------------------------------------------------------------------------
+
+function AutoKaitun:Teleport(cframe)
+    local char = Players.LocalPlayer.Character
+    if not char then
+        logger:warn("Character not found")
+        return false
+    end
+
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        logger:warn("HumanoidRootPart not found")
+        return false
+    end
+
+    local ok = pcall(function()
+        hrp.CFrame = cframe + Vector3.new(0, 6, 0)
+    end)
+
+    if ok then
+        task.wait(0.5)
+    end
+
+    return ok
+end
+
+--------------------------------------------------------------------------
+-- Auto Buy Rod
+--------------------------------------------------------------------------
+
+function AutoKaitun:ScanAllRods()
+    local rodsList = {}
+    if not self.ItemsFolder then return rodsList end
+
+    local function scanFolder(folder)
+        for _, child in pairs(folder:GetChildren()) do
+            if child:IsA("ModuleScript") then
+                local success, itemData = pcall(require, child)
+                if success and itemData and itemData.Data then
+                    if itemData.Data.Type == "Fishing Rods" and itemData.Price then
+                        table.insert(rodsList, {
+                            name = itemData.Data.Name or "Unknown",
+                            id = itemData.Data.Id or 0,
+                            price = itemData.Price or 0,
+                            tier = itemData.Data.Tier or 1
+                        })
+                    end
+                end
+            elseif child:IsA("Folder") then
+                scanFolder(child)
+            end
+        end
+    end
+
+    scanFolder(self.ItemsFolder)
+
+    return rodsList
+end
+
+function AutoKaitun:BuyTargetRod()
+    if not Remotes.PurchaseRod then
+        logger:warn("Purchase remote not available")
+        return false
+    end
+
+    if not self.PhaseConfig then
+        logger:warn("No phase config available")
+        return false
+    end
+
+    local targetRodId = self.PhaseConfig.targetRodId
+    local targetRodName = self.PhaseConfig.targetRodName
+
+    logger:info(string.format("🛒 Attempting to buy: %s (ID: %d)", targetRodName, targetRodId))
+
+    local success, result = pcall(function()
+        return Remotes.PurchaseRod:InvokeServer(targetRodId)
+    end)
+
+    if success and result then
+        logger:info(string.format("✅ Successfully purchased: %s", targetRodName))
+        return true
+    else
+        logger:warn(string.format("❌ Failed to purchase: %s", targetRodName))
+        return false
+    end
+end
+
+--------------------------------------------------------------------------
+-- Main Control
+--------------------------------------------------------------------------
+
+function AutoKaitun:Start()
+    if not self.Initialized then
+        logger:warn("Not initialized! Call Init() first!")
+        return false
+    end
+
+    if self.Running then
+        logger:warn("Already running!")
+        return false
+    end
+
+    if self.CurrentPhase == "COMPLETE" then
+        logger:info("🎉 Kaitun already complete!")
+        return false
+    end
+
+    logger:info("="..string.rep("=", 50))
+    logger:info(string.format("🚀 Starting Kaitun - %s", self.PhaseConfig.name))
+    logger:info(string.format("📍 Target: %s", self.PhaseConfig.targetRodName))
+    logger:info(string.format("💰 Need: %s coins", self:FormatNumber(self.PhaseConfig.targetCoins)))
+    logger:info("="..string.rep("=", 50))
+
+    -- Check current coins
+    self.CurrentCoins = self:GetCurrentCoins()
+    logger:info(string.format("💵 Current coins: %s", self:FormatNumber(self.CurrentCoins)))
+
+    if self.CurrentCoins >= self.PhaseConfig.targetCoins then
+        logger:info("Already have enough coins!")
+        self:BuyTargetRod()
+        return false
+    end
+
+    self.Running = true
+
+    -- Start tracking
+    self:StartCoinsTracking()
+
+    -- Start farming
+    task.wait(0.5)
+    self:StartAutoFish()
+
+    task.wait(1)
+    self:StartAutoSell()
+
+    logger:info("✅ Kaitun started successfully!")
+    return true
+end
+
+function AutoKaitun:Stop()
+    if not self.Running then
+        logger:warn("Not running!")
+        return false
+    end
+
+    logger:info("⏸️ Stopping Kaitun...")
+
+    self.Running = false
+
+    self:StopCoinsTracking()
+    self:StopAutoFish()
+    self:StopAutoSell()
+
+    logger:info("✅ Kaitun stopped!")
+    return true
+end
+
+function AutoKaitun:Cleanup()
+    logger:info("🧹 Cleaning up...")
+
+    if self.Running then
+        self:Stop()
+    end
+
+    self:StopCoinsTracking()
+
+    self.PlayerData = nil
+    self.ItemsFolder = nil
+    self.CurrentPhase = nil
+    self.PhaseConfig = nil
+    self.Initialized = false
+
+    logger:info("✅ Cleanup complete!")
+end
+
+function AutoKaitun:GetStatus()
+    return {
+        Initialized = self.Initialized,
+        Running = self.Running,
+        CurrentPhase = self.CurrentPhase,
+        PhaseName = self.PhaseConfig and self.PhaseConfig.name or "None",
+        TargetRod = self.PhaseConfig and self.PhaseConfig.targetRodName or "None",
+        CurrentCoins = self.CurrentCoins,
+        TargetCoins = self.PhaseConfig and self.PhaseConfig.targetCoins or 0,
+        Progress = self.PhaseConfig and string.format("%.1f%%", (self.CurrentCoins / self.PhaseConfig.targetCoins) * 100) or "0%",
+        FishingActive = self.FishingActive,
+        SellingActive = self.SellingActive
+    }
+end
+
+return AutoKaitun
